@@ -1,0 +1,3 @@
+go build server.go node.go configuration.go util.go
+
+server.exe create 4000
