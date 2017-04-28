@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/rpc"
 	"net/rpc/jsonrpc"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -19,9 +19,10 @@ const (
 	TIME_WAIT_FIX_FINGERS          = 500 * time.Millisecond // Periodic time wait for fixFinger method (millisecond).
 	TIME_WAIT_CHECK_PREDECESSOR    = 500 * time.Millisecond // Interval after which a predecessor is checked for its live condition.
 	TIMEOUT_QUERY_TO_COMMIT        = 1000 * time.Millisecond
-	WRITE_DELAY                    = false
+	WRITE_DELAY                    = true
 	TIME_WAIT_WRITE_DELAY          = 10 * time.Second
 	TIME_WAIT_BEFORE_KV_ADJUSTMENT = 2500 * time.Millisecond
+	PRINT_CONSOLE                  = true
 )
 
 // The unique identifier of a node in the chord ring.
@@ -113,8 +114,10 @@ func (t *Node) stabilize() {
 				service = t.SuccessorList[i].getAddress()
 				succ = t.SuccessorList[i]
 
+				//conn, erri := net.DialTimeout("tcp", service,5*time.Second)
 				client, err = jsonrpc.Dial("tcp", service)
 				if err == nil {
+					//client = jsonrpc.NewClient(conn)
 					break
 				} else {
 					service = ""
@@ -198,13 +201,21 @@ func (t *Node) checkPredecessor() {
 		time.Sleep(TIME_WAIT_CHECK_PREDECESSOR)
 
 		if t.Predecessor != nil {
-			_, err := jsonrpc.Dial("tcp", t.Predecessor.getAddress())
+			//_, err := net.DialTimeout("tcp", t.Predecessor.getAddress(),5*time.Second)
+			client, err := jsonrpc.Dial("tcp", t.Predecessor.getAddress())
 			// If not able to call => predecessor has failed.
 			if err != nil {
 				t.Predecessor = nil
+			} else {
+				client.Close()
 			}
 		}
 	}
+}
+
+func (t *Node) Ping(inp struct{}, reply *bool) error {
+	*reply = true
+	return nil
 }
 
 func (t *Node) askclosestPreceedingNode(key uint32) *NodeIdentifier {
@@ -237,6 +248,13 @@ func (t *Node) askclosestPreceedingNode(key uint32) *NodeIdentifier {
 	}
 
 	return nil
+}
+
+func (t *Node) print(b bool, res string) {
+	t.logger.Print(res)
+	if b {
+		fmt.Println(res)
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -290,15 +308,25 @@ func getSuccessor(myKey uint32, joinNode *NodeIdentifier) *NodeIdentifier {
 	return &successorNodeIdentifier
 }
 
+func (t *Node) GetLocalSuccessorList(inp struct{}, reply *[]*NodeIdentifier) error {
+	*reply = t.SuccessorList
+	return nil
+}
+
 //////////////////////////////////////////////////////////////////////////////////////
 // Data specific operations along with methods which make RPC calls.
 
+type KeyReplica struct {
+	Key        string
+	Replicanum int
+}
+
 // Returns the value of the specified key from the data stored.
-func (t *Node) GetValue(key *string, value *string) error {
+func (t *Node) GetValue(kr KeyReplica, value *string) error {
 
 	t.mutex.Lock()
-	if t.Data[0] != nil {
-		if val, ok := t.Data[0][*key]; ok {
+	if t.Data[kr.Replicanum] != nil {
+		if val, ok := t.Data[kr.Replicanum][kr.Key]; ok {
 			*value = val
 			t.mutex.Unlock()
 			return nil
@@ -310,10 +338,9 @@ func (t *Node) GetValue(key *string, value *string) error {
 	return errors.New("Key does not exist.")
 }
 
-// Returns the value of the provided key stored.
+// Returns the value of the provided key stored from random repica
 func (t *Node) read(key string) string {
 	keyHash := t.Config.getKey1(key)
-	fmt.Println(strconv.Itoa(int(keyHash)))
 
 	firstSuccessor := t.findSuccessor(keyHash)
 
@@ -321,18 +348,41 @@ func (t *Node) read(key string) string {
 
 	client, err := jsonrpc.Dial("tcp", service)
 	if err != nil {
+		t.print(PRINT_CONSOLE, "Error connecting to first replica to get successor list.")
+		return ""
+	}
 
-		t.logger.Print("Error connecting to data containing node. Returning Empty string.")
+	var succlist []*NodeIdentifier
+	var inp struct{}
+	err = client.Call("Node.GetLocalSuccessorList", inp, &succlist)
+	if err != nil {
+		t.print(PRINT_CONSOLE, err.Error())
+		return ""
+	}
+	client.Close()
+
+	copy(succlist[1:], succlist[0:])
+	succlist[0] = firstSuccessor
+
+	replicanum := rand.Intn(t.Config.k + 1)
+	service = succlist[replicanum].getAddress()
+
+	client, err = jsonrpc.Dial("tcp", service)
+	if err != nil {
+		t.print(PRINT_CONSOLE, "Error connecting to random replica for read.")
 		return ""
 	}
 
 	var value string
-	err = client.Call("Node.GetValue", &key, &value)
+	err = client.Call("Node.GetValue", KeyReplica{key, replicanum}, &value)
 	if err != nil {
 		t.logger.Print(err.Error())
+		t.print(PRINT_CONSOLE, err.Error())
+		return ""
 	}
 	client.Close()
 
+	t.print(PRINT_CONSOLE, "Value read from "+service)
 	return value
 }
 
@@ -363,9 +413,16 @@ func (t *Node) RollBack(kv *KeyValue, result *bool) error {
 }
 
 // Rollback if something goes wrong during final commit.
-func (t *Node) CommitRollBack(kvr *KeyValueReplica, result *bool) error {
-	for _, elem := range kvr.Replicanum {
-		delete(t.Data[elem], kvr.KV.Key)
+func (t *Node) Abort(kvr *KeyValueReplica, result *bool) error {
+	t.print(PRINT_CONSOLE, "Aborting !!!")
+	if kvr.KV.Value == "" {
+		for _, elem := range kvr.Replicanum {
+			delete(t.Data[elem], kvr.KV.Key)
+		}
+	} else {
+		for _, elem := range kvr.Replicanum {
+			t.Data[elem][kvr.KV.Key] = kvr.KV.Value
+		}
 	}
 
 	*result = true
@@ -395,6 +452,13 @@ func (t *Node) CommitWrite(kvr *KeyValueReplica, result *bool) error {
 // TODO: have to handle the above case also. Might not be needed in the presence of Successor List.
 func (t *Node) SetValue(kv *KeyValue, result *bool) error {
 
+	var oldKV KeyValue
+	if val, ok := t.Data[0][kv.Key]; ok {
+		oldKV = KeyValue{kv.Key, val}
+	} else {
+		oldKV = KeyValue{kv.Key, ""}
+	}
+
 	successorsReplied := make(map[string]string)
 	querySent := make(map[string][]int)
 
@@ -418,7 +482,7 @@ func (t *Node) SetValue(kv *KeyValue, result *bool) error {
 
 		client, err := jsonrpc.Dial("tcp", service)
 		if err != nil {
-			t.logger.Print("Error in setting up connection for QUERY TO COMMIT: " + err.Error())
+			t.print(PRINT_CONSOLE, "Error in setting up connection for QUERY TO COMMIT: "+err.Error())
 			canCommit = false
 			break
 		}
@@ -429,12 +493,12 @@ func (t *Node) SetValue(kv *KeyValue, result *bool) error {
 		select {
 		case ret = <-ret.Done:
 			if ret.Error != nil {
-				t.logger.Print("Error in query to commit: " + err.Error())
+				t.print(PRINT_CONSOLE, "Error in query to commit: "+err.Error())
 				canCommit = false
 				break
 			}
 		case <-time.After(TIMEOUT_QUERY_TO_COMMIT):
-			t.logger.Print("Timeout in query to commit.")
+			t.print(PRINT_CONSOLE, "Timeout in query to commit.")
 			canCommit = false
 			break
 		}
@@ -451,7 +515,7 @@ func (t *Node) SetValue(kv *KeyValue, result *bool) error {
 			client, err := jsonrpc.Dial("tcp", service)
 			if err != nil {
 				// Successor is dead.
-				t.logger.Print("Error in dialing for ROLLBACK: " + err.Error())
+				t.print(PRINT_CONSOLE, "Error in dialing for ROLLBACK: "+err.Error())
 				continue
 			}
 
@@ -459,7 +523,7 @@ func (t *Node) SetValue(kv *KeyValue, result *bool) error {
 			err = client.Call("Node.RollBack", &kv, &res)
 
 			if err != nil {
-				t.logger.Print("Error in ROLLBACK call:" + err.Error())
+				t.print(PRINT_CONSOLE, "Error in ROLLBACK call:"+err.Error())
 			}
 
 			client.Close()
@@ -490,40 +554,49 @@ func (t *Node) SetValue(kv *KeyValue, result *bool) error {
 
 		client, err := jsonrpc.Dial("tcp", service)
 		if err != nil {
-			t.logger.Print("Error in dial for COMMIT:" + err.Error())
+			t.print(PRINT_CONSOLE, "Error in dial for COMMIT:"+err.Error())
+			res = false
 			continue
 		}
 
+		var reply bool
 		kvr := KeyValueReplica{*kv, listreplicas}
-		err = client.Call("Node.CommitWrite", &kvr, &res)
+		err = client.Call("Node.CommitWrite", &kvr, &reply)
 
 		client.Close()
 
-		if err != nil || res == false {
-			t.logger.Print("Error in COMMIT RPC:" + err.Error())
+		if err != nil {
+			t.print(PRINT_CONSOLE, "Error in COMMIT RPC:"+err.Error())
 			res = false
-			break
+			continue
 		}
 
 		successfulCommit = append(successfulCommit, service)
 	}
 
 	if res == false {
-		t.logger.Print("Error during COMMIT of some process. Rolling back.")
-		for _, elem := range myRepIndices {
-			delete(t.Data[elem], kv.Key)
+		t.print(PRINT_CONSOLE, "Error during COMMIT of some process. Rolling back.")
+		
+		if oldKV.Value == "" {
+			for _, elem := range myRepIndices {
+				delete(t.Data[elem], kv.Key)
+			}
+		} else {
+			for _, elem := range myRepIndices {
+				t.Data[elem][kv.Key] = oldKV.Value
+			}
 		}
 
 		for _, service := range successfulCommit {
 			client, err := jsonrpc.Dial("tcp", service)
 			if err != nil {
-				t.logger.Print("Error in dialing:" + err.Error())
+				t.print(PRINT_CONSOLE, "Error in dialing:"+err.Error())
 				continue
 			}
 
 			var dummy bool
-			kvr := KeyValueReplica{*kv, querySent[service]}
-			err = client.Call("Node.CommitRollBack", &kvr, &dummy)
+			kvr := KeyValueReplica{oldKV, querySent[service]}
+			err = client.Call("Node.Abort", &kvr, &dummy)
 
 			client.Close()
 		}
@@ -545,8 +618,8 @@ func (t *Node) write(key string, value string) bool {
 
 	client, err := jsonrpc.Dial("tcp", service)
 	if err != nil {
-		t.logger.Print("Error in contacting the first successor of the key:" + key)
-		t.logger.Print(err.Error())
+		t.print(PRINT_CONSOLE, "Error in contacting the first successor of the key:"+key)
+		t.print(PRINT_CONSOLE, err.Error())
 	}
 
 	kv := KeyValue{key, value}
@@ -597,7 +670,7 @@ func (t *Node) DeleteKV(kv *KeyValue, result *bool) error {
 
 		client, err := jsonrpc.Dial("tcp", service)
 		if err != nil {
-			t.logger.Print("Error in dial QUERY TO COMMIT: " + err.Error())
+			t.print(PRINT_CONSOLE, "Error in dial QUERY TO COMMIT: "+err.Error())
 			canCommit = false
 			break
 		}
@@ -608,12 +681,12 @@ func (t *Node) DeleteKV(kv *KeyValue, result *bool) error {
 		select {
 		case ret = <-ret.Done:
 			if ret.Error != nil {
-				t.logger.Print("Error in QUERY TO COMMIT: " + err.Error())
+				t.print(PRINT_CONSOLE, "Error in QUERY TO COMMIT: "+err.Error())
 				canCommit = false
 				break
 			}
 		case <-time.After(TIMEOUT_QUERY_TO_COMMIT):
-			fmt.Println("Timeout in QUERY TO COMMIT.")
+			t.print(true, "Timeout in QUERY TO COMMIT.")
 			canCommit = false
 			break
 		}
@@ -631,7 +704,7 @@ func (t *Node) DeleteKV(kv *KeyValue, result *bool) error {
 
 			client, err := jsonrpc.Dial("tcp", service)
 			if err != nil {
-				t.logger.Print("Error dial in ROLLBACK: " + err.Error())
+				t.print(PRINT_CONSOLE, "Error dial in ROLLBACK: "+err.Error())
 				continue
 				// Cannot commit.
 			}
@@ -640,7 +713,7 @@ func (t *Node) DeleteKV(kv *KeyValue, result *bool) error {
 			err = client.Call("Node.RollBack", &kv, &result)
 
 			if err != nil {
-				t.logger.Print("Error in ROLLBACK:" + err.Error())
+				t.print(PRINT_CONSOLE, "Error in ROLLBACK:"+err.Error())
 			}
 
 			client.Close()
@@ -654,7 +727,7 @@ func (t *Node) DeleteKV(kv *KeyValue, result *bool) error {
 	for service, listreplicas := range querySent {
 		client, err := jsonrpc.Dial("tcp", service)
 		if err != nil {
-			t.logger.Print("Error in dial during COMMIT:" + err.Error())
+			t.print(PRINT_CONSOLE, "Error in dial during COMMIT:"+err.Error())
 			break
 		}
 
@@ -664,7 +737,7 @@ func (t *Node) DeleteKV(kv *KeyValue, result *bool) error {
 		err = client.Call("Node.CommitDelete", &kvr, &result)
 
 		if err != nil || result == false {
-			t.logger.Print("Error in COMMIT:" + err.Error())
+			t.print(PRINT_CONSOLE, "Error in COMMIT:"+err.Error())
 			continue
 		}
 
@@ -698,7 +771,7 @@ func (t *Node) remove(key string) bool {
 
 	client, err := jsonrpc.Dial("tcp", service)
 	if err != nil {
-		t.logger.Print("Error dialing: " + err.Error())
+		t.print(PRINT_CONSOLE, "Error dialing: "+err.Error())
 		return false
 	}
 
@@ -719,7 +792,7 @@ func (t *Node) transferKV() {
 	service := t.SuccessorList[0].getAddress()
 	client, err := jsonrpc.Dial("tcp", service)
 	if err != nil {
-		t.logger.Print("Error transfering KV dialing: " + err.Error())
+		t.print(PRINT_CONSOLE, "Error transfering KV dialing: "+err.Error())
 		return
 	}
 
@@ -730,12 +803,12 @@ func (t *Node) transferKV() {
 	t.mutex.Unlock()
 
 	if err != nil {
-		t.logger.Print("Error transfering KV RPC: " + err.Error())
+		t.print(PRINT_CONSOLE, "Error transfering KV RPC: "+err.Error())
 		return
 	}
 
 	client.Close()
-	fmt.Println("Key values assigned from successor")
+	t.print(true, "Key values assigned from successor")
 
 }
 
@@ -778,7 +851,7 @@ func (t *Node) AdjustKVJoin(newnodehash uint32, reply *[]map[string]string) erro
 			service := t.SuccessorList[i].getAddress()
 			client, err := jsonrpc.Dial("tcp", service)
 			if err != nil {
-				t.logger.Print("Error adjusting KV dialing: " + err.Error())
+				t.print(PRINT_CONSOLE, "Error adjusting KV dialing: "+err.Error())
 				break
 			}
 
@@ -786,7 +859,7 @@ func (t *Node) AdjustKVJoin(newnodehash uint32, reply *[]map[string]string) erro
 			var reply bool
 			err = client.Call("Node.AdjustKVJoinSucc", splitdict, &reply)
 			if err != nil {
-				t.logger.Print("Error adjusting KV RPC: " + err.Error())
+				t.print(PRINT_CONSOLE, "Error adjusting KV RPC: "+err.Error())
 				break
 			}
 			client.Close()
@@ -813,7 +886,7 @@ func (t *Node) AdjustKVJoinSucc(splitdict SplitDict, reply *bool) error {
 
 	t.mutex.Unlock()
 
-	t.logger.Print("Key value adjustment done on node join.")
+	t.print(PRINT_CONSOLE, "Key value adjustment done on node join.")
 
 	*reply = true
 	return nil
@@ -832,7 +905,7 @@ func (t *Node) AdjustKVLeave(num int) {
 		givekv := t.Data[:t.Config.k-i]
 		client, err := jsonrpc.Dial("tcp", service)
 		if err != nil {
-			t.logger.Print("Error adjusting KV leave dialing: " + err.Error())
+			t.print(PRINT_CONSOLE, "Error adjusting KV leave dialing: "+err.Error())
 			break
 		}
 
@@ -841,9 +914,10 @@ func (t *Node) AdjustKVLeave(num int) {
 		err = client.Call("Node.AdjustKVLeaveSucc", arg, &reply)
 
 		if err != nil {
-			t.logger.Print("Error adjusting KV leave RPC: " + err.Error())
+			t.print(PRINT_CONSOLE, "Error adjusting KV leave RPC: "+err.Error())
 			break
 		}
+		client.Close()
 	}
 }
 
@@ -854,7 +928,7 @@ func (t *Node) AdjustKVLeaveSucc(arg ArgKVLeave, reply *bool) error {
 		service := t.Predecessor.getAddress()
 		client, err := jsonrpc.Dial("tcp", service)
 		if err != nil {
-			t.logger.Print("Error pred dialing: " + err.Error())
+			t.print(PRINT_CONSOLE, "Error pred dialing: "+err.Error())
 			*reply = false
 		}
 
@@ -862,10 +936,10 @@ func (t *Node) AdjustKVLeaveSucc(arg ArgKVLeave, reply *bool) error {
 		err = client.Call("Node.GetDict", 0, &dictarr)
 
 		if err != nil {
-			t.logger.Print("Error pred RPC: " + err.Error())
+			t.print(PRINT_CONSOLE, "Error pred RPC: "+err.Error())
 			*reply = false
 		}
-
+		client.Close()
 		copy(t.Data[1:], dictarr[:t.Config.k])
 
 	} else {
@@ -882,7 +956,7 @@ func (t *Node) AdjustKVLeaveSucc(arg ArgKVLeave, reply *bool) error {
 
 	t.mutex.Unlock()
 
-	t.logger.Print("Key value adjustment done on node leave.")
+	t.print(PRINT_CONSOLE, "Key value adjustment done on node leave.")
 
 	*reply = true
 	return nil
