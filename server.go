@@ -133,7 +133,6 @@ func main() {
 			fmt.Println()
 		default:
 			fmt.Println("Wrong choice !!!")
-			os.Exit(1)
 		}
 
 	}
@@ -142,8 +141,8 @@ func main() {
 
 // Creating a new chord ring.
 func create(myNodeIdentifier *NodeIdentifier, config Configuration) Node {
-	myKey := config.getKey(myNodeIdentifier)
-	fmt.Println(strconv.Itoa(int(myKey)))
+	//myKey := config.getKey(myNodeIdentifier)
+	//fmt.Println(strconv.Itoa(int(myKey)))
 
 	var successor = NodeIdentifier{myNodeIdentifier.IP, myNodeIdentifier.Port}
 	successorList := make([]*NodeIdentifier, config.r, config.r)
@@ -167,13 +166,8 @@ func create(myNodeIdentifier *NodeIdentifier, config Configuration) Node {
 // Joining an existing chord ring by contacting a joinManagerNode.
 func join(myNodeIdentifier *NodeIdentifier, joinManagerNodeIdentifier *NodeIdentifier, config Configuration) Node {
 	myKey := config.getKey(myNodeIdentifier)
-	fmt.Println(strconv.Itoa(int(myKey)))
 
 	successorNodeIdentifier := getSuccessor(myKey, joinManagerNodeIdentifier)
-
-	if successorNodeIdentifier == nil {
-		//fmt.Println("1")
-	}
 
 	successorList := make([]*NodeIdentifier, config.r, config.r)
 	successorList[0] = successorNodeIdentifier
